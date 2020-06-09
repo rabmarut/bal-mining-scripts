@@ -98,7 +98,13 @@ async function getRewardsAtBlock(i) {
             } else {
                 userPools[pool.controller] = [{ address: poolAddress, value: poolMarketCap }]
             }
-            
+
+            // Add this pool liquidity to total user liquidity
+            if (userLiquidity[pool.controller]) {
+                userLiquidity[pool.controller] += userPoolValue;
+            } else {
+                userLiquidity[pool.controller] = userPoolValue;
+            }
         } else { // Shared pool
             for (const holder of shareHolders) {
                 let userBalanceWei = await bPool.methods.balanceOf(holder).call(undefined, i);
