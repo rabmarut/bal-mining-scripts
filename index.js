@@ -102,7 +102,6 @@ function isWrapPair(tokenA, tokenB) {
 }
 
 function getWrapFactor(tokens, weights) {
-    let ratioFactorSum = bnum(0);
     let wrapFactorSum = bnum(0);
     let pairWeightSum = bnum(0);
     let n = weights.length;
@@ -125,6 +124,34 @@ function getWrapFactor(tokens, weights) {
     return wrapFactor;
 }
 
+function getTokenMarketCap(i, block, prices, bPool, token) {
+    // Skip token if it doesn't have a price
+    if (prices[token] === undefined || prices[token].length === 0) {
+        return 0;
+    }
+
+    // Query token balance
+    let bToken = new web3.eth.Contract(tokenAbi, token);
+    let tokenBalanceWei = await bPool.methods
+        .getBalance(token)
+        .call(undefined, i);
+    let tokenDecimals = await bToken.methods.decimals().call();
+
+    // Query token price
+    let closestPrice = prices[token].reduce((a, b) => {
+        return Math.abs(b[0] - block.timestamp * 1000) <
+            Math.abs(a[0] - block.timestamp * 1000)
+            ? b
+            : a;
+    })[1];
+
+    // Compute token market cap
+    let tokenBalance = utils.scale(tokenBalanceWei, -tokenDecimals);
+    let tokenMarketCap = tokenBalance.times(bnum(closestPrice)).dp(18);
+
+    return tokenMarketCap;
+}
+
 if (!argv.startBlock || !argv.endBlock || !argv.week) {
     console.log(
         'Usage: node index.js --week 1 --startBlock 10131642 --endBlock 10156690'
@@ -142,6 +169,8 @@ const BAL_PER_SNAPSHOT = BAL_PER_WEEK.div(
     bnum(Math.ceil((END_BLOCK - START_BLOCK) / 64))
 ); // Ceiling because it includes end block
 
+const MARKET_CAP_CEILING = bum(10000000);
+
 async function getRewardsAtBlock(i, pools, prices, poolProgress) {
     let totalBalancerLiquidity = bnum(0);
 
@@ -153,9 +182,11 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
 
     poolProgress.update(0, { task: `Block ${i} Progress` });
 
+    // Compute total market cap per token across all pools
     for (const pool of pools) {
         let poolAddress = pool.id;
 
+        // Skip pool if it doesn't exist yet
         if (pool.createTime > block.timestamp || !pool.tokensList) {
             continue;
         }
@@ -167,26 +198,8 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
             .call(undefined, i);
 
         for (const t of currentTokens) {
-            // Skip token if it doesn't have a price
             let token = web3.utils.toChecksumAddress(t);
-            if (prices[token] === undefined || prices[token].length === 0) {
-                continue;
-            }
-            let bToken = new web3.eth.Contract(tokenAbi, token);
-            let tokenBalanceWei = await bPool.methods
-                .getBalance(token)
-                .call(undefined, i);
-            let tokenDecimals = await bToken.methods.decimals().call();
-
-            let closestPrice = prices[token].reduce((a, b) => {
-                return Math.abs(b[0] - block.timestamp * 1000) <
-                    Math.abs(a[0] - block.timestamp * 1000)
-                    ? b
-                    : a;
-            })[1];
-
-            let tokenBalance = utils.scale(tokenBalanceWei, -tokenDecimals);
-            let tokenMarketCap = tokenBalance.times(bnum(closestPrice)).dp(18);
+            let tokenMarketCap = getTokenMarketCap(i, block, prices, bPool, token);
 
             if (tokenTotalMarketCaps[token]) {
                 tokenTotalMarketCaps[token] = bnum(tokenTotalMarketCaps[token])
@@ -198,13 +211,14 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
         }
     }
 
+    // Compute BAL rewards per pool
     for (const pool of pools) {
         let poolAddress = pool.id;
 
-        // Check if at least two tokens have a price
         let atLeastTwoTokensHavePrice = false;
         let nTokensHavePrice = 0;
 
+        // Skip pool if it doesn't exist yet
         if (pool.createTime > block.timestamp || !pool.tokensList) {
             poolProgress.increment(1);
             continue;
@@ -212,6 +226,7 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
 
         let bPool = new web3.eth.Contract(poolAbi, poolAddress);
 
+        // Skip pool if not public swappable
         let publicSwap = await bPool.methods.isPublicSwap().call(undefined, i);
         if (!publicSwap) {
             poolProgress.increment(1);
@@ -222,6 +237,7 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
             .getCurrentTokens()
             .call(undefined, i);
 
+        // Check if at least two tokens have a price
         for (const t of currentTokens) {
             let token = web3.utils.toChecksumAddress(t);
             if (prices[token] !== undefined && prices[token].length > 0) {
@@ -241,39 +257,19 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
         let shareHolders = pool.shares.flatMap((a) => a.userAddress.id);
 
         let poolMarketCap = bnum(0);
-        let poolMarketCapFactor = bnum(0);
-
         let poolRatios = [];
 
+        // Compute adjusted liquidity of whole pool
         for (const t of currentTokens) {
-            // Skip token if it doesn't have a price
             let token = web3.utils.toChecksumAddress(t);
-            if (prices[token] === undefined || prices[token].length === 0) {
-                continue;
-            }
-            let bToken = new web3.eth.Contract(tokenAbi, token);
-            let tokenBalanceWei = await bPool.methods
-                .getBalance(token)
-                .call(undefined, i);
-            let tokenDecimals = await bToken.methods.decimals().call();
-            let normWeight = await bPool.methods
-                .getNormalizedWeight(token)
-                .call(undefined, i);
+            let tokenMarketCap = getTokenMarketCap(i, block, prices, bPool, token);
 
-            let closestPrice = prices[token].reduce((a, b) => {
-                return Math.abs(b[0] - block.timestamp * 1000) <
-                    Math.abs(a[0] - block.timestamp * 1000)
-                    ? b
-                    : a;
-            })[1];
-
-            let tokenBalance = utils.scale(tokenBalanceWei, -tokenDecimals);
-            let tokenMarketCap = tokenBalance.times(bnum(closestPrice)).dp(18);
+            // If token appears in cap list, adjust market cap accordingly
             if (
                 !uncappedTokens.includes(token) &&
-                bnum(tokenTotalMarketCaps[token]).isGreaterThan(bnum(10000000))
+                bnum(tokenTotalMarketCaps[token]).isGreaterThan(MARKET_CAP_CEILING)
             ) {
-                let tokenMarketCapFactor = bnum(10000000).div(
+                let tokenMarketCapFactor = MARKET_CAP_CEILING.div(
                     tokenTotalMarketCaps[token]
                 );
                 adjustedTokenMarketCap = tokenMarketCap
@@ -282,10 +278,15 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
             } else {
                 adjustedTokenMarketCap = tokenMarketCap;
             }
+
+            let normWeight = await bPool.methods
+                .getNormalizedWeight(token)
+                .call(undefined, i);
             poolRatios.push(utils.scale(normWeight, -18));
             poolMarketCap = poolMarketCap.plus(adjustedTokenMarketCap);
         }
 
+        // Compute ratio factor, wrap factor, and fee factor
         let ratioFactor = getRatioFactor(poolRatios);
         let wrapFactor = getWrapFactor(currentTokens, poolRatios);
 
@@ -293,7 +294,7 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
         poolFee = utils.scale(poolFee, -16); // -16 = -18 * 100 since it's in percentage terms
         let feeFactor = bnum(getFeeFactor(poolFee));
 
-        poolMarketCapFactor = feeFactor
+        let poolMarketCapFactor = feeFactor
             .times(ratioFactor)
             .times(wrapFactor)
             .times(poolMarketCap)
@@ -302,6 +303,7 @@ async function getRewardsAtBlock(i, pools, prices, poolProgress) {
             poolMarketCapFactor
         );
 
+        // Compute user share of pool liquidity
         let bptSupplyWei = await bPool.methods.totalSupply().call(undefined, i);
         let bptSupply = utils.scale(bptSupplyWei, -18);
 
